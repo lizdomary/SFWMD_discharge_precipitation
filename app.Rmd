@@ -1,0 +1,369 @@
+---
+title: "Buoy data analysis"
+author: "Liz D. Ortiz Munoz"
+date: "2025-01-07"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+    theme: cosmo
+    df_print: paged
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  message = FALSE,
+  warning = FALSE
+)
+```
+
+# **Purpose**
+
+To evaluate how biogeochemical water quality variables interact and vary across wet and dry seasons in two urban canals (Coral Gables and Little River) using principal component analysis (PCA).
+
+
+**Notes**
+
+- Discharge and precipitation extracted from DBHYDRO for both sites (instantaneous flow data from 2021-04-01 to 2023-12-01).
+- Biogeochemical parameters were extracted from Florida International University BUOY Data (instantaneous data from 2021-04-01 to 2023-12-01).
+
+**DBHYDRO references**
+
+- Coral Gables site G93 (DBKEY 64745): https://my.sfwmd.gov/dbhydroplsql/show_dbkey_info.date_selection?v_js_flag=Y&v_db_request_id=8750783&v_parameter_string=&v_dbkey=64745&v_frequency=&v_sdate=19911001&v_edate=20240326&v_datum=
+- Little River site S27 (DBKEY 65069): https://my.sfwmd.gov/dbhydroplsql/show_dbkey_info.date_selection?v_js_flag=Y&v_db_request_id=8750772&v_parameter_string=&v_dbkey=65069&v_frequency=&v_sdate=19850531&v_edate=20240326&v_datum=
+- Miami realtime portal: http://my.sfwmd.gov/portal/pls/portal/realtime.pkg_rr.proc_rr?p_op=MIAMI
+
+---
+
+# **Libraries**
+```{r}
+
+# Install notes (optional):
+# install.packages("astsa")
+# install.packages("segmented")
+
+library(astsa)
+pacman::p_load(tidyverse, cowplot, lubridate, dplyr, dplR, zoo)
+
+library(naniar)
+library(DescTools)   # PlotACF function
+library(WaveletComp)
+library(matrixStats)
+library(tidyr)
+library(ggplot2)
+library(readr)
+library(gridExtra)
+library(ggpubr)
+library(viridis)
+
+library(car)
+library(devtools)
+library(janitor)
+
+library(neonOS)
+library(terra)
+library(imputeTS)
+library(corrplot)
+library(segmented)
+library(rcompanion)
+library(FactoMineR)
+library(factoextra)
+library(FSA)
+library(rcompanion)
+```
+
+---
+
+# **Working directory**
+```{r}
+# If you did not start RStudio from the project file, set your working directory:
+setwd("/Users/lizortiz/Library/CloudStorage/OneDrive-FloridaInternationalUniversity/SFWMD_discharge_precipitation")
+```
+---
+
+# **Load datasets**
+```{r}
+# merge buoy_data and discharge (only variables that I want)
+new_data <- read.csv("new_data.csv")
+head(new_data)
+tail(new_data)
+
+# merge new_data (buoy_data and discharge) with precipitation
+new_data_prep <- read.csv("new_data_prep.csv")
+head(new_data_prep)
+tail(new_data_prep)
+
+# merge all buoy variables with discharge and precipitation
+new_data_all_final <- read.csv("new_data_all_final.csv")
+head(new_data_all_final)
+tail(new_data_all_final)
+```
+
+---
+
+# **Data adjustments and filtering**
+```{r}
+# Add wet/dry seasons + split date
+new_data_all_final_2 <- new_data_all_final %>%
+  separate(Date, into = c("Year", "Month", "Day"), sep = "-", remove = FALSE) %>%
+  mutate(
+    Year  = as.character(Year),
+    Month = as.character(Month),
+    Day   = as.character(Day)
+  )
+
+new_data_all_final_2$Seasons <- ifelse(
+  grepl("5|6|7|8|9|10", new_data_all_final_2$Month, ignore.case = TRUE),
+  "Wet",
+  "Dry"
+)
+
+# Replace original
+new_data_all_final <- new_data_all_final_2
+
+# Convert discharge to Q (m3/s)
+new_data_all_final$Q <- new_data_all_final$Discharge * 0.028316846592
+
+# Ensure Date class
+new_data_all_final$Date <- as.Date(new_data_all_final$Date)
+
+# Remove rows between 2021-11-11 and 2021-11-23 (bad temp/cond values)
+new_data_all_final_filtered <- new_data_all_final %>%
+  filter(!(Date >= as.Date("2021-11-11") & Date <= as.Date("2021-11-23")))
+
+# Remove pH outliers
+new_data_all_final_filtered_2 <- new_data_all_final_filtered %>%
+  mutate(daily_EXO_pH = ifelse(daily_EXO_pH < 5 | daily_EXO_pH > 10, NA, daily_EXO_pH))
+
+# Final working dataset
+new_data_2 <- new_data_all_final_filtered_2
+
+# Save
+write.csv(new_data_2, "new_data_2_20260216.csv", row.names = FALSE)
+
+# Subset canals
+new_data_2_coral <- subset(new_data_all_final_filtered_2, Canal == "Coral_Gables")
+new_data_2_river <- subset(new_data_all_final_filtered_2, Canal == "Little_River")
+
+dat2 <- subset(new_data_all_final_filtered_2, Canal == "Little_River")
+dat  <- subset(new_data_all_final_filtered_2, Canal == "Coral_Gables")
+```
+
+---
+
+# **PCA: Little River**
+
+```{r}
+
+bio_variables_little <- dat2[, c(
+  "daily_EXO_fdom",
+  "daily_EXO_spCond",
+  "daily_EXO_do_mgL",
+  "daily_EXO_sal_psu",
+  "daily_EXO_pH",
+  "daily_EXO_chla_ugL",
+  "Q",
+  "daily_EXO_Turbidity_NTU",
+  "Year",
+  "Seasons",
+  "Month"
+)]
+
+bio_variables_little$Month <- as.character(bio_variables_little$Month)
+bio_variables_little <- na.omit(bio_variables_little)
+
+bio_variables_little <- bio_variables_little %>%
+  dplyr::rename(
+    fDOM          = daily_EXO_fdom,
+    Conductivity  = daily_EXO_spCond,
+    DO            = daily_EXO_do_mgL,
+    Salinity      = daily_EXO_sal_psu,
+    pH            = daily_EXO_pH,
+    Chlorophyll_a = daily_EXO_chla_ugL,
+    Discharge     = Q
+  )
+
+iris.pca_little <- PCA(bio_variables_little[, c(1:8)], scale = TRUE, graph = FALSE)
+
+fviz_pca_biplot(
+  iris.pca_little,
+  col.ind = bio_variables_little$Seasons,
+  palette = "jco",
+  label = "var",
+  col.var = "black",
+  repel = TRUE,
+  addEllipses = TRUE,
+  legend.title = "Groups"
+)
+
+```
+
+
+
+## **PC scores + seasonal comparison (Little River)**
+
+```{r}
+scores_little <- as.data.frame(iris.pca_little$ind$coord)
+bio_variables_little$PC1 <- scores_little$Dim.1
+bio_variables_little$PC2 <- scores_little$Dim.2
+
+
+
+pca1_box_little <- ggplot(bio_variables_little, aes(y = PC1, x = Seasons, color = Seasons)) +
+  geom_violin() +
+  geom_boxplot(width = 0.1) +
+  geom_jitter(shape = 16, position = position_jitter(0.2)) +
+  labs(x = "", y = "PC1", color = "Seasons") +
+  theme_minimal()
+
+pca2_box_little <- ggplot(bio_variables_little, aes(y = PC2, x = Seasons, color = Seasons)) +
+  geom_violin() +
+  geom_boxplot(width = 0.1) +
+  geom_jitter(shape = 16, position = position_jitter(0.2)) +
+  labs(x = "", y = "PC2", color = "Seasons") +
+  theme_minimal()
+
+pca_box_little <- ggarrange(
+  pca1_box_little, pca2_box_little,
+  ncol = 2,
+  common.legend = TRUE
+)
+
+pca_box_little
+```
+
+
+## **Stats: Little River (Kruskal + Dunn + CLD)**
+```{r}
+kruskal.test(PC1 ~ Seasons, data = bio_variables_little)
+
+
+
+dunn_results <- dunnTest(PC1 ~ Seasons, data = bio_variables_little, method = "bonferroni")
+p_table <- dunn_results$res
+cld <- cldList(P.adj ~ Comparison, data = p_table, threshold = 0.05)
+print(cld)
+
+kruskal.test(PC2 ~ Seasons, data = bio_variables_little)
+
+dunn_results <- dunnTest(PC2 ~ Seasons, data = bio_variables_little, method = "bonferroni")
+p_table <- dunn_results$res
+cld <- cldList(P.adj ~ Comparison, data = p_table, threshold = 0.05)
+print(cld)
+```
+
+---
+
+# **PCA: Coral Gables**
+```{r}
+bio_variables <- dat[, c(
+  "daily_EXO_fdom",
+  "daily_EXO_spCond",
+  "daily_EXO_do_mgL",
+  "daily_EXO_sal_psu",
+  "daily_EXO_pH",
+  "daily_EXO_chla_ugL",
+  "Q",
+  "daily_EXO_Turbidity_NTU",
+  "Year",
+  "Seasons",
+  "Month"
+)]
+
+bio_variables$Month <- as.character(bio_variables$Month)
+bio_variables <- na.omit(bio_variables)
+
+bio_variables <- bio_variables %>%
+  dplyr::rename(
+    fDOM          = daily_EXO_fdom,
+    Conductivity  = daily_EXO_spCond,
+    DO            = daily_EXO_do_mgL,
+    Salinity      = daily_EXO_sal_psu,
+    pH            = daily_EXO_pH,
+    Chlorophyll_a = daily_EXO_chla_ugL,
+    Discharge     = Q
+  )
+
+iris.pca <- PCA(bio_variables[, c(1:8)], scale = TRUE, graph = FALSE)
+
+fviz_pca_biplot(
+  iris.pca,
+  col.ind = bio_variables$Seasons,
+  palette = "jco",
+  label = "var",
+  col.var = "black",
+  repel = TRUE,
+  addEllipses = TRUE,
+  legend.title = "Groups"
+)
+```
+
+
+
+## **PC scores + seasonal comparison (Coral Gables)**
+
+```{r}
+scores <- as.data.frame(iris.pca$ind$coord)
+bio_variables$PC1 <- scores$Dim.1
+bio_variables$PC2 <- scores$Dim.2
+
+pca1_box_coral <- ggplot(bio_variables, aes(y = PC1, x = Seasons, color = Seasons)) +
+  geom_violin() +
+  geom_boxplot(width = 0.1) +
+  geom_jitter(shape = 16, position = position_jitter(0.2)) +
+  labs(x = "", y = "PC1", color = "Seasons") +
+  theme_minimal()
+
+pca2_box_coral <- ggplot(bio_variables, aes(y = PC2, x = Seasons, color = Seasons)) +
+  geom_violin() +
+  geom_boxplot(width = 0.1) +
+  geom_jitter(shape = 16, position = position_jitter(0.2)) +
+  labs(x = "", y = "PC2", color = "Seasons") +
+  theme_minimal()
+
+pca_box_coral <- ggarrange(
+  pca1_box_coral, pca2_box_coral,
+  ncol = 2,
+  common.legend = TRUE
+)
+
+pca_box_coral
+```
+
+
+
+## **Stats: Coral Gables (Kruskal + Dunn + CLD)**
+```{r}
+kruskal.test(PC1 ~ Seasons, data = bio_variables)
+
+dunn_results <- dunnTest(PC1 ~ Seasons, data = bio_variables, method = "bonferroni")
+p_table <- dunn_results$res
+cld <- cldList(P.adj ~ Comparison, data = p_table, threshold = 0.05)
+print(cld)
+
+kruskal.test(PC2 ~ Seasons, data = bio_variables)
+
+dunn_results <- dunnTest(PC2 ~ Seasons, data = bio_variables, method = "bonferroni")
+p_table <- dunn_results$res
+cld <- cldList(P.adj ~ Comparison, data = p_table, threshold = 0.05)
+print(cld)
+```
+
+---
+
+# **Results**
+
+## **Little River **
+
+- A PCA of Little River water quality variables showed clear seasonal separation. PC1 (48.8% of variance) primarily represents a gradient from higher salinity, conductivity, DO, and pH (marine influence) to higher discharge and fDOM (freshwater influence). The wet season tends to shift toward the freshwater–discharge–fDOM side, whereas the dry season is associated with higher salinity and conductivity, suggesting stronger marine influence.
+- Statistical tests confirmed these seasonal differences, as PC1 and PC2 both differed significantly between wet and dry seasons (Kruskal–Wallis p < 2.2×10⁻¹⁶). This indicates that hydrological seasonality strongly structures water quality conditions in Little River.
+
+## **Coral Gables**
+
+- A PCA of Coral Gables water quality variables also showed clear seasonal differences. PC1 (49% of variance) represents a gradient from higher salinity, conductivity, DO, and pH (marine influence) to higher discharge and fDOM (freshwater influence). The dry season is more associated with the marine-influenced side of the gradient, while the wet season shifts toward higher discharge and fDOM conditions.
+- Seasonal differences were statistically significant for both PC1 (p = 1.45 × 10⁻¹⁰) and PC2 (p < 2.2 × 10⁻¹⁶), indicating that seasonal hydrology significantly influences water quality dynamics in Coral Gables Canal.
+
+---
+
