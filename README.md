@@ -1,5 +1,7 @@
 # **Seasonal Water Quality Dynamics in Urban Canals Using High-Frequency Sensor Data**
 
+- Website: https://rpubs.com/lizdomary/1405474
+  
 ## Project Overview
 
 - This project analyzes high-frequency water quality data collected from buoy sensors in two urban canals in Miami, Florida: Coral Gables Canal and Little River. The analysis integrates continuous sensor measurements, discharge data from the South Florida Water Management District (SFWMD DBHYDRO), and precipitation records to evaluate how water quality conditions vary between the wet and dry seasons.
